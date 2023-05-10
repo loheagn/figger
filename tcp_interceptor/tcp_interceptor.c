@@ -24,6 +24,7 @@ struct data {
 } dev;
 
 static int proc_ok;
+static int pass_ok;
 
 static ssize_t proc_read(struct file *file, char __user *usr_buf, size_t count,
                          loff_t *pos) {
@@ -46,6 +47,13 @@ static ssize_t proc_read(struct file *file, char __user *usr_buf, size_t count,
     return rv;
 }
 
+static ssize_t proc_write(struct file *file, const char __user *usr_buf,
+                          size_t count, loff_t *pos) {
+    pass_ok = 1;
+
+    return count;
+}
+
 static __poll_t proc_poll(struct file *file, struct poll_table_struct *wait) {
     unsigned long ino = file_inode(file)->i_ino;
     printk(KERN_INFO "proc_poll called with inode %lu\n", ino);
@@ -63,6 +71,7 @@ static __poll_t proc_poll(struct file *file, struct poll_table_struct *wait) {
 
 static struct proc_ops proc_ops = {
     .proc_read = proc_read,
+    .proc_write = proc_write,
     .proc_poll = proc_poll,
 };
 
@@ -73,8 +82,13 @@ static int nf_handler(void *priv, struct sk_buff *skb,
     struct iphdr *ip_header = (struct iphdr *)skb_network_header(skb);
     if (ip_header->protocol == IPPROTO_TCP) {
         struct tcphdr *tcp_header = (struct tcphdr *)skb_transport_header(skb);
-        if (tcp_header->dest == htons(80)) {
-            printk(KERN_INFO "TCP packet to port 80\n");
+        if (tcp_header->dest == htons(6699)) {
+            if (pass_ok) return NF_ACCEPT;
+
+            printk(KERN_INFO "TCP packet to port 6699\n");
+            proc_ok = 1;
+            wake_up_interruptible(&dev.wq_head);
+            return NF_DROP;
         }
     } else if (ip_header->protocol == IPPROTO_UDP) {
         struct udphdr *udp_header = (struct udphdr *)skb_transport_header(skb);
@@ -83,8 +97,6 @@ static int nf_handler(void *priv, struct sk_buff *skb,
         }
     } else if (ip_header->protocol == IPPROTO_ICMP) {
         printk(KERN_INFO "ICMP packet\n");
-        proc_ok = 1;
-        wake_up_interruptible(&dev.wq_head);
     }
 
     return NF_ACCEPT;

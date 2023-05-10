@@ -3,6 +3,7 @@ package main
 import (
 	"log"
 	"os"
+	"os/exec"
 	"syscall"
 	"unsafe"
 )
@@ -58,6 +59,20 @@ func selectFile(filename string) {
 	log.Printf("isset %v\n", fd.IsSet(file.Fd()))
 
 	readProcFile(filename)
+
+	err = exec.Command("bash", "-c", "systemctl start nginx").Run()
+	if err != nil {
+		panic(err)
+	}
+	err = exec.Command("bash", "-c", "ipvsadm -a -t 192.168.174.134:6699 -r 192.168.174.134:80 -m -w 1").Run()
+	if err != nil {
+		panic(err)
+	}
+
+	err = os.WriteFile(filename, []byte("hello world"), 0644)
+	if err != nil {
+		panic(err)
+	}
 }
 
 func main() {
