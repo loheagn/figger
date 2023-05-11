@@ -1,4 +1,5 @@
 #include <asm/uaccess.h>
+#include <linux/hashtable.h>
 #include <linux/init.h>
 #include <linux/ip.h>
 #include <linux/kernel.h>
@@ -12,6 +13,14 @@
 #include <linux/tcp.h>
 #include <linux/udp.h>
 #include <linux/wait.h>
+
+#define MIN_PORT 10000
+#define MAX_PORT 11000
+
+#define FIGGER_MODULE "FIGGER"
+
+#define PROC_DIR "figger"
+struct proc_dir_entry *dir_entry;
 
 #define BUFFER_SIZE 128
 
@@ -85,7 +94,7 @@ static int nf_handler(void *priv, struct sk_buff *skb,
         if (tcp_header->dest == htons(6699)) {
             if (pass_ok) return NF_ACCEPT;
 
-            printk(KERN_INFO "TCP packet to port 6699\n");
+            printk(KERN_INFO "DROP TCP packet to port 6699\n");
             proc_ok = 1;
             wake_up_interruptible(&dev.wq_head);
             return NF_DROP;
@@ -124,11 +133,39 @@ void rm_nf_hook(void) {
     }
 }
 
+void create_batch_proc(void) {
+    // create proc dir
+    dir_entry = proc_mkdir(PROC_DIR, NULL);
+
+    int i;
+    char *name;
+    name = (char *)kmalloc(10, GFP_KERNEL);
+    for (i = MIN_PORT; i <= MAX_PORT; i++) {
+        sprintf(name, "tcp-%d", i);
+        proc_create(name, 0, dir_entry, &proc_ops);
+        printk(KERN_INFO FIGGER_MODULE "/proc/%s created\n", name);
+    }
+}
+
+void remove_batch_proc(void) {
+    int i;
+    char *name;
+    name = (char *)kmalloc(10, GFP_KERNEL);
+    for (i = MIN_PORT; i <= MAX_PORT; i++) {
+        sprintf(name, "tcp-%d", i);
+        remove_proc_entry(name, dir_entry);
+        printk(KERN_INFO FIGGER_MODULE "/proc/%s removed\n", name);
+    }
+
+    // remove proc dir
+    remove_proc_entry(PROC_DIR, NULL);
+}
+
 static int tcp_interceptor_init(void) {
     mutex_init(&dev.poll_mutex);
     init_waitqueue_head(&dev.wq_head);
-    proc_create(PROC_NAME, 0, NULL, &proc_ops);
-    printk(KERN_INFO "/proc/%s created\n", PROC_NAME);
+
+    create_batch_proc();
 
     register_nf_hook();
 
@@ -136,10 +173,8 @@ static int tcp_interceptor_init(void) {
 }
 
 static void tcp_interceptor_exit(void) {
-    remove_proc_entry(PROC_NAME, NULL);
+    remove_batch_proc();
     rm_nf_hook();
-
-    printk(KERN_INFO "/proc/%s removed\n", PROC_NAME);
 }
 
 /* Macros for registering module entry and exit points. */
