@@ -1,14 +1,17 @@
 #include <asm/uaccess.h>
+#include <linux/delay.h>
 #include <linux/hashtable.h>
 #include <linux/init.h>
 #include <linux/ip.h>
 #include <linux/kernel.h>
+#include <linux/kthread.h>
 #include <linux/module.h>
 #include <linux/mutex.h>
 #include <linux/netfilter.h>
 #include <linux/netfilter_ipv4.h>
 #include <linux/poll.h>
 #include <linux/proc_fs.h>
+#include <linux/sched.h>
 #include <linux/string.h>
 #include <linux/tcp.h>
 #include <linux/udp.h>
@@ -17,6 +20,8 @@
 #define MIN_PORT 10000
 #define MAX_PORT 11000
 #define MAX_PORT_NUM (MAX_PORT - MIN_PORT + 1)
+
+#define TIMEOUT 10
 
 #define FIGGER_MODULE "FIGGER "
 
@@ -28,6 +33,7 @@ struct proc_dir_entry *dir_entry;
 struct port_t {
     int state;  // 0 -> stopped; 1 -> starting; 2 -> started; 3 -> stopping
     int last_read_state;
+    time64_t last_in;
     wait_queue_head_t wq_head;
     struct mutex poll_mutex;
 };
@@ -135,6 +141,10 @@ static int deal_with_tcp_udp(int port_num) {
     if (!check_port_range(port_num)) return NF_ACCEPT;
 
     struct port_t *port = get_port_by_port_num(port_num, 0);
+    struct timespec64 now;
+    ktime_get_ts64(&now);
+    port->last_in = now.tv_sec;
+
     switch (port->state) {
         case 0:
             change_port_state(port, 1);
@@ -247,10 +257,49 @@ void rm_port_list(void) {
     kfree(port_list);
 }
 
+static struct task_struct *check_timeout_thread;
+
+int check_timeout(void *_arg) {
+    printk(KERN_INFO FIGGER_MODULE "the thread to check timeout started\n");
+    while (!kthread_should_stop()) {
+        struct timespec64 now;
+        ktime_get_ts64(&now);
+        int i;
+        for (i = 0; i < MAX_PORT_NUM * 2; i++) {
+            struct port_t *port;
+            port = &port_list[i];
+            if (port->last_in == 0 || now.tv_sec - port->last_in <= TIMEOUT) {
+                continue;
+            }
+
+            // stop port
+            change_port_state(port, 3);
+            port->last_in = 0;
+        }
+
+        msleep(1000);
+    }
+
+    return 0;
+}
+
+int create_check_timeout_thread(void) {
+    check_timeout_thread = kthread_run(check_timeout, NULL, "check_timeout");
+    if (IS_ERR(check_timeout_thread)) {
+        printk(KERN_INFO FIGGER_MODULE "error creating thread\n");
+        return 1;
+    }
+    return 0;
+}
+
 static int tcp_interceptor_init(void) {
     create_batch_proc();
     init_port_list();
     register_nf_hook();
+
+    if (create_check_timeout_thread()) {
+        return 1;
+    }
 
     return 0;
 }
@@ -259,6 +308,8 @@ static void tcp_interceptor_exit(void) {
     remove_batch_proc();
     rm_port_list();
     rm_nf_hook();
+
+    kthread_stop(check_timeout_thread);
 }
 
 module_init(tcp_interceptor_init);

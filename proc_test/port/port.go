@@ -2,7 +2,6 @@ package port
 
 import (
 	"fmt"
-	"log"
 	"os"
 	"proc_test/cmd"
 	"strings"
@@ -77,8 +76,6 @@ func (p *Port) AddBackends() error {
 	if p.State == PortStarting || p.State == PortStarted {
 		return nil
 	}
-
-	log.Println("add backends 2")
 
 	oldState := p.State
 	p.State = PortStarting
