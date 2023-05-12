@@ -3,138 +3,120 @@ package main
 import (
 	"log"
 	"os"
-	"os/exec"
+	"proc_test/logging"
+	"proc_test/port"
 	"syscall"
-	"time"
-	"unsafe"
 )
 
-// read proc file
-func readProcFile(filename string) {
-
-	content, _ := os.ReadFile(filename)
-
-	log.Printf("File content: %s\n", content)
-}
-
-type fdset syscall.FdSet
-
-func (s *fdset) Sys() *syscall.FdSet {
-	return (*syscall.FdSet)(s)
-}
-
-func (s *fdset) Set(fd uintptr) {
-	bits := 8 * unsafe.Sizeof(s.Bits[0])
-	if fd >= bits*uintptr(len(s.Bits)) {
-		panic("fdset: fd out of range")
-	}
-	n := fd / bits
-	m := fd % bits
-	s.Bits[n] |= 1 << m
-}
-
-func (s *fdset) IsSet(fd uintptr) bool {
-	bits := 8 * unsafe.Sizeof(s.Bits[0])
-	if fd >= bits*uintptr(len(s.Bits)) {
-		panic("fdset: fd out of range")
-	}
-	n := fd / bits
-	m := fd % bits
-	return s.Bits[n]&(1<<m) != 0
-}
-
-func readAndTrigger(filename string) {
-	readProcFile(filename)
-
-	err := exec.Command("bash", "-c", "systemctl start nginx").Run()
-	if err != nil {
-		panic(err)
-	}
-	err = exec.Command("bash", "-c", "ipvsadm -a -t 192.168.174.134:6699 -r 192.168.174.134:80 -m -w 1").Run()
-	if err != nil {
-		panic(err)
-	}
-
-	err = os.WriteFile(filename, []byte("hello world"), 0644)
-	if err != nil {
-		panic(err)
-	}
-}
-
-func cleanup() {
-	err := exec.Command("bash", "-c", "systemctl stop nginx").Run()
-	if err != nil {
-		panic(err)
-	}
-	err = exec.Command("bash", "-c", "ipvsadm -D -t 192.168.174.134:6699").Run()
-	if err != nil {
-		panic(err)
-	}
-	err = exec.Command("bash", "-c", "ipvsadm -A -t 192.168.174.134:6699 -s rr").Run()
-	if err != nil {
-		panic(err)
-	}
-}
-
-// syscall.Select file
-func selectFile(filename string) {
-	var fd fdset
-	file, err := os.Open(filename)
-	if err != nil {
-		log.Fatal(err)
-	}
-	fd.Set(file.Fd())
-	n, err := syscall.Select(int(file.Fd())+1, fd.Sys(), nil, nil, nil)
-	if err != nil {
-		log.Fatal(err)
-	}
-	log.Printf("ready %d\n", n)
-
-	log.Printf("isset %v\n", fd.IsSet(file.Fd()))
-
-	readAndTrigger(filename)
-}
-
-func epoll_test(filename string) {
+func monitorPorts(portList []*port.Port) {
 	epfd, err := syscall.EpollCreate1(0)
 	if err != nil {
 		log.Fatal(err)
 	}
 	defer syscall.Close(epfd)
 
-	file, err := os.Open(filename)
-	if err != nil {
-		log.Fatal(err)
+	portMap := make(map[int32]*port.Port)
+
+	for _, port := range portList {
+		filename := port.ProcFile()
+		file, err := os.Open(filename)
+		if err != nil {
+			log.Fatal(err)
+		}
+
+		portMap[int32(file.Fd())] = port
+
+		var event syscall.EpollEvent
+		event.Events = syscall.EPOLLIN
+		event.Fd = int32(file.Fd())
+
+		err = syscall.EpollCtl(epfd, syscall.EPOLL_CTL_ADD, int(file.Fd()), &event)
+		if err != nil {
+			log.Fatal(err)
+		}
+
 	}
 
-	var event syscall.EpollEvent
-	event.Events = syscall.EPOLLIN
-	event.Fd = int32(file.Fd())
+	for {
+		events := make([]syscall.EpollEvent, 1)
+		_, err = syscall.EpollWait(epfd, events, -1)
+		if err != nil {
+			log.Fatal(err)
+		}
 
-	err = syscall.EpollCtl(epfd, syscall.EPOLL_CTL_ADD, int(file.Fd()), &event)
-	if err != nil {
-		log.Fatal(err)
-	}
-
-	events := make([]syscall.EpollEvent, 1)
-	n, err := syscall.EpollWait(epfd, events, -1)
-	if err != nil {
-		log.Fatal(err)
-	}
-	log.Printf("ready %d\n", n)
-
-	for _, event := range events {
-		if event.Fd == int32(file.Fd()) {
-			readAndTrigger(filename)
+		for _, event := range events {
+			port := portMap[event.Fd]
+			go handleActivePort(port)
 		}
 	}
 
 }
 
-func main() {
-	// selectFile(os.Args[1])
-	epoll_test(os.Args[1])
+func handleActivePort(p *port.Port) {
+	filename := p.ProcFile()
+	content, err := os.ReadFile(filename)
+	if err != nil {
+		logging.Error("read file %s failed: %v", filename, err)
+	}
+	returnMsg := ""
+	switch content[0] {
+	case '1':
+		err := p.AddBackends()
+		if err != nil {
+			logging.Error("add backends failed: %v", err)
+		}
+		if p.State == port.PortStarted {
+			returnMsg = "2"
+		}
 
-	time.Sleep(10 * time.Second)
-	cleanup()
+	case '3':
+		err := p.RemoveBackends()
+		if err != nil {
+			logging.Error("remove backends failed: %v", err)
+		}
+		if p.State == port.PortStopped {
+			returnMsg = "0"
+		}
+	}
+
+	if returnMsg == "" {
+		return
+	}
+
+	if err := os.WriteFile(filename, []byte(returnMsg), 0644); err != nil {
+		logging.Error("write file %s failed: %v", filename, err)
+	}
+}
+
+func addPort(portList []*port.Port, num int, protocal string) ([]*port.Port, error) {
+	port := port.NewPort(num, protocal)
+	if err := port.Setup(); err != nil {
+		return nil, err
+	}
+	portList = append(portList, port)
+	return portList, nil
+}
+
+func main() {
+
+	if len(os.Args) >= 2 && os.Args[1] == "cleanup" {
+		for i := 10600; i < 10700; i++ {
+			port := port.NewPort(i, "tcp")
+			if err := port.Shutdown(); err != nil {
+				log.Fatal(err)
+			}
+		}
+		return
+	}
+
+	portList := make([]*port.Port, 0)
+	var err error
+	for i := 10600; i < 10700; i++ {
+		portList, err = addPort(portList, i, "tcp")
+		if err != nil {
+			log.Fatal(err)
+		}
+	}
+
+	monitorPorts(portList)
 }
