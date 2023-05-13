@@ -1,55 +1,129 @@
 package main
 
 import (
+	"fmt"
 	"log"
+	"net/http"
 	"os"
+	"strconv"
+	"strings"
+	"sync"
+
 	"proc_test/logging"
 	"proc_test/port"
-	"syscall"
+
+	"golang.org/x/sys/unix"
 )
 
-func monitorPorts(portList []*port.Port) {
-	epfd, err := syscall.EpollCreate1(0)
+type PortAction struct {
+	num      int
+	protocal string
+	add      bool // true: add port, false: remove port
+}
+
+func monitor(portActionChan <-chan *PortAction, stopChan <-chan struct{}) {
+	epfd, err := unix.EpollCreate1(0)
 	if err != nil {
 		log.Fatal(err)
 	}
-	defer syscall.Close(epfd)
+	defer unix.Close(epfd)
 
-	portMap := make(map[int32]*port.Port)
+	procFile2PortMap := make(map[int]*port.Port)
+	portName2ProFileMap := make(map[string]int)
 
-	for _, port := range portList {
-		filename := port.ProcFile()
+	addPort := func(action *PortAction) error {
+		p := port.NewPort(action.num, action.protocal)
+		if err := p.Setup(); err != nil {
+			return err
+		}
+
+		filename := p.ProcFile()
 		file, err := os.Open(filename)
 		if err != nil {
-			log.Fatal(err)
+			return err
+		}
+		defer file.Close()
+
+		if _, err := file.Write([]byte("0")); err != nil {
+			return err
 		}
 
-		portMap[int32(file.Fd())] = port
-
-		var event syscall.EpollEvent
-		event.Events = syscall.EPOLLIN
-		event.Fd = int32(file.Fd())
-
-		err = syscall.EpollCtl(epfd, syscall.EPOLL_CTL_ADD, int(file.Fd()), &event)
+		err = unix.EpollCtl(epfd, unix.EPOLL_CTL_ADD, int(file.Fd()), &unix.EpollEvent{Events: unix.POLLIN | unix.POLLHUP, Fd: int32(file.Fd())})
 		if err != nil {
-			log.Fatal(err)
+			return err
 		}
 
+		procFile2PortMap[int(file.Fd())] = p
+		portName2ProFileMap[p.String()] = int(file.Fd())
+
+		return nil
 	}
+
+	removePort := func(action *PortAction) error {
+		portName := fmt.Sprintf("%s-%d", action.protocal, action.num)
+		fd := portName2ProFileMap[portName]
+		p := procFile2PortMap[fd]
+
+		err := unix.EpollCtl(epfd, unix.EPOLL_CTL_DEL, int(fd), nil)
+		if err != nil {
+			return err
+		}
+
+		if err := p.Shutdown(); err != nil {
+			return err
+		}
+
+		delete(portName2ProFileMap, portName)
+		delete(procFile2PortMap, fd)
+
+		return nil
+	}
+
+	stopAll := func() {
+		for _, p := range procFile2PortMap {
+			_ = p.Shutdown()
+		}
+	}
+
+	epollEventsChan := make(chan []unix.EpollEvent)
+
+	go func() {
+		for {
+			events := make([]unix.EpollEvent, 1)
+			_, err = unix.EpollWait(epfd, events, -1)
+			if err != nil {
+				log.Fatal(err)
+			}
+			epollEventsChan <- events
+		}
+	}()
 
 	for {
-		events := make([]syscall.EpollEvent, 1)
-		_, err = syscall.EpollWait(epfd, events, -1)
-		if err != nil {
-			log.Fatal(err)
-		}
+		select {
+		case events := <-epollEventsChan:
+			for _, event := range events {
+				port := procFile2PortMap[int(event.Fd)]
+				go handleActivePort(port)
+			}
 
-		for _, event := range events {
-			port := portMap[event.Fd]
-			go handleActivePort(port)
+		case portAction := <-portActionChan:
+			switch portAction.add {
+			case true:
+				err := addPort(portAction)
+				if err != nil {
+					logging.Error("add port %d failed: %v", portAction.num, err)
+				}
+			case false:
+				err := removePort(portAction)
+				if err != nil {
+					logging.Error("remove port %d failed: %v", portAction.num, err)
+				}
+			}
+
+		case <-stopChan:
+			stopAll()
 		}
 	}
-
 }
 
 func handleActivePort(p *port.Port) {
@@ -88,35 +162,55 @@ func handleActivePort(p *port.Port) {
 	}
 }
 
-func addPort(portList []*port.Port, num int, protocal string) ([]*port.Port, error) {
-	port := port.NewPort(num, protocal)
-	if err := port.Setup(); err != nil {
-		return nil, err
+func setupHTTPServer(portActionChan chan<- *PortAction, stopChan chan<- struct{}) {
+	mux := http.NewServeMux()
+	mux.Handle("/stop", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		stopChan <- struct{}{}
+
+		_, err := w.Write([]byte("stop all ports"))
+		if err != nil {
+			logging.Error("write response failed: %v", err)
+		}
+	}))
+	mux.Handle("/add", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		num, _ := strconv.Atoi(r.URL.Query().Get("num"))
+		protocol := r.URL.Query().Get("protocol")
+		portActionChan <- &PortAction{num: num, protocal: strings.ToLower(protocol), add: true}
+
+		_, err := w.Write([]byte(fmt.Sprintf("add port %d", num)))
+		if err != nil {
+			logging.Error("write response failed: %v", err)
+		}
+	}))
+	mux.Handle("/remove", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		num, _ := strconv.Atoi(r.URL.Query().Get("num"))
+		protocol := r.URL.Query().Get("protocol")
+		portActionChan <- &PortAction{num: num, protocal: strings.ToLower(protocol), add: false}
+
+		_, err := w.Write([]byte(fmt.Sprintf("remove port %d", num)))
+		if err != nil {
+			logging.Error("write response failed: %v", err)
+		}
+	}))
+
+	err := http.ListenAndServe(":8899", mux)
+	if err != nil {
+		log.Fatalf("http server failed: %v", err)
 	}
-	portList = append(portList, port)
-	return portList, nil
 }
 
 func main() {
-
-	if len(os.Args) >= 2 && os.Args[1] == "cleanup" {
-		for i := 10600; i < 10700; i++ {
-			port := port.NewPort(i, "tcp")
-			if err := port.Shutdown(); err != nil {
-				log.Fatal(err)
-			}
-		}
-		return
-	}
-
-	portList := make([]*port.Port, 0)
-	var err error
-	for i := 10600; i < 10700; i++ {
-		portList, err = addPort(portList, i, "tcp")
-		if err != nil {
-			log.Fatal(err)
-		}
-	}
-
-	monitorPorts(portList)
+	portActionChan := make(chan *PortAction)
+	stopChan := make(chan struct{})
+	wg := sync.WaitGroup{}
+	wg.Add(2)
+	go func() {
+		monitor(portActionChan, stopChan)
+		wg.Done()
+	}()
+	go func() {
+		setupHTTPServer(portActionChan, stopChan)
+		wg.Done()
+	}()
+	wg.Wait()
 }

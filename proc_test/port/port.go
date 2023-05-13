@@ -39,6 +39,10 @@ func NewPort(num int, protocal string) *Port {
 	return &Port{Num: num, Protocal: Protocal(strings.ToLower(protocal)), State: PortStopped, mutex: sync.Mutex{}}
 }
 
+func (p *Port) String() string {
+	return fmt.Sprintf("%s-%d", p.Protocal, p.Num)
+}
+
 func (p *Port) formatIPVSArg() string {
 	arg := "-t"
 	if p.Protocal == UDP {

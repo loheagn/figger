@@ -48,8 +48,9 @@ void change_port_state(struct port_t *port, int state) {
     mutex_lock(&port->poll_mutex);
     port->state = state;
     if (port->state == 1 || port->state == 3) {
-        printk(KERN_INFO FIGGER_MODULE "wake up, state: %d\n", port->state);
         wake_up_interruptible(&port->wq_head);
+    } else if (port->state == 0) {
+        port->last_in = 0;
     }
     mutex_unlock(&port->poll_mutex);
 }
